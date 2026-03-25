@@ -9,23 +9,78 @@ PORT = 1883
 SENSOR_TOPIC = "irrigation/ESP001/sensors"
 COMMAND_TOPIC = "irrigation/ESP001/command"
 
-DB_FILE = "sensor_data.db"
+PROFILES_DB = "profiles.db"
+SENSOR_DATA_DB = "sensor_data_v1.db"
+PLANT_DB = "plants.db"
+PROFILES = "profiles"
+SENSOR_DATA = "sensor_data_v1"
+PLANTS = "plants"
 
 
-def init_db():
-
-    conn = sqlite3.connect(DB_FILE)
+def init_profiles_db():
+    conn = sqlite3.connect(PROFILES_DB)
     cursor = conn.cursor()
 
     cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sensor_data (
+        f"""
+        CREATE TABLE IF NOT EXISTS {PROFILES} (
+            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            email TEXT,
+            password TEXT
+        )
+    """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def init_sensor_db():
+
+    conn = sqlite3.connect(SENSOR_DATA_DB)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {SENSOR_DATA} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plant_id INTEGER,
             temperature REAL,
             humidity REAL,
             soil INTEGER,
             distance REAL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            irrigation_status INTEGER,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (plant_id) REFERENCES plants(plant_id)
+        )
+    """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def init_plants_db():
+    conn = sqlite3.connect(PLANT_DB)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {PLANTS} (
+            plant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            plant_name TEXT,
+            plant_type TEXT,
+            plant_age INTEGER,
+            plant_height REAL,
+            pot_type TEXT,
+            pot_size REAL,
+            notes TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (user_id) REFERENCES profiles(user_id)
         )
     """
     )
@@ -36,19 +91,20 @@ def init_db():
 
 def save_sensor_data(data):
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(SENSOR_DATA_DB)
     cursor = conn.cursor()
 
     cursor.execute(
         """
-        INSERT INTO sensor_data (temperature, humidity, soil, distance)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO sensor_data_v1 (temperature, humidity, soil, distance, irrigation_status)
+        VALUES (?, ?, ?, ?, ?)
     """,
         (
             data.get("temperature"),
             data.get("humidity"),
             data.get("soil"),
             data.get("distance"),
+            data.get("irrigation_status"),
         ),
     )
 
@@ -104,7 +160,9 @@ mqtt_client.on_message = on_message
 
 def main():
 
-    init_db()
+    init_profiles_db()
+    init_sensor_db()
+    init_plants_db()
 
     mqtt_client.connect(BROKER, PORT, 60)
 
