@@ -1,190 +1,111 @@
-import sqlite3
-import json
-import paho.mqtt.client as mqtt
+import threading
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
+from ml_model import predict_water
+from mqtt_handler import mqtt_client, on_connect, on_message, send_command, start_mqtt
+from config import BROKER, PORT
+from db_handler import (
+    init_profiles_db,
+    init_sensor_db,
+    init_plants_db,
+    update_plant_dynamic_fields,
+    get_plants_for_watering,
+    log_irrigation_event,
+    get_latest_data_with_plant,
+    get_plants_schedule,
+)
+from irrigation_logic import decide_irrigation
 
-BROKER = "127.0.0.1"
-PORT = 1883
+scheduler = BackgroundScheduler()
 
-SENSOR_TOPIC = "irrigation/ESP001/sensors"
-COMMAND_TOPIC = "irrigation/ESP001/command"
+# -------------------------------
+# SCHEDULER JOBS
+# -------------------------------
 
-PROFILES_DB = "profiles.db"
-SENSOR_DATA_DB = "sensor_data_v1.db"
-PLANT_DB = "plants.db"
-PROFILES = "profiles"
-SENSOR_DATA = "sensor_data_v1"
-PLANTS = "plants"
+last_run = {}
 
 
-def init_profiles_db():
-    conn = sqlite3.connect(PROFILES_DB)
-    cursor = conn.cursor()
+def trigger_irrigation(plant_id, user_id, mode="manual_ml"):
 
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {PROFILES} (
-            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            email TEXT,
-            password TEXT
+    data = get_latest_data_with_plant(plant_id)
+
+    if not data:
+        print(f"⚠️ No data for plant {plant_id}")
+        return None
+
+    water, status = decide_irrigation(data)
+
+    if status == 0 or water is None or water <= 0:
+        print(f"❌ No irrigation needed for plant {plant_id}")
+        return None
+
+    send_command(user_id, plant_id, water)
+    log_irrigation_event(plant_id, water, mode)
+
+    print(f"✅ Irrigation triggered → Plant {plant_id}: {water}")
+
+    return water
+
+
+def schedule_all_plants():
+    for job in scheduler.get_jobs():
+        if job.id.startswith("plant_"):
+            scheduler.remove_job(job.id)
+
+    plants = get_plants_schedule()
+
+    for plant in plants:
+        plant_id = plant["plant_id"]
+        user_id = plant["user_id"]
+        watering_time = plant.get("watering_time")
+
+        if not watering_time:
+            continue
+
+        hour, minute = map(int, watering_time.split(":"))
+
+        scheduler.add_job(
+            trigger_irrigation,
+            "cron",
+            hour=hour,
+            minute=minute,
+            args=[plant_id, user_id, "scheduled_ml"],
+            id=f"plant_{plant_id}",
+            replace_existing=True,
         )
-    """
-    )
 
-    conn.commit()
-    conn.close()
+        print(f"⏰ Scheduled Plant {plant_id} at {watering_time}")
 
 
-def init_sensor_db():
+def run_scheduler():
+    scheduler.start()
 
-    conn = sqlite3.connect(SENSOR_DATA_DB)
-    cursor = conn.cursor()
+    # ✅ Load schedules from DB
+    schedule_all_plants()
 
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SENSOR_DATA} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plant_id INTEGER,
-            temperature REAL,
-            humidity REAL,
-            soil INTEGER,
-            distance REAL,
-            irrigation_status INTEGER,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    scheduler.add_job(update_plant_dynamic_fields, "interval", hours=1)
 
-            FOREIGN KEY (plant_id) REFERENCES plants(plant_id)
-        )
-    """
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def init_plants_db():
-    conn = sqlite3.connect(PLANT_DB)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {PLANTS} (
-            plant_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            plant_name TEXT,
-            plant_type TEXT,
-            plant_age INTEGER,
-            plant_height REAL,
-            pot_type TEXT,
-            pot_size REAL,
-            notes TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-            FOREIGN KEY (user_id) REFERENCES profiles(user_id)
-        )
-    """
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def save_sensor_data(data):
-
-    conn = sqlite3.connect(SENSOR_DATA_DB)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO sensor_data_v1 (temperature, humidity, soil, distance, irrigation_status)
-        VALUES (?, ?, ?, ?, ?)
-    """,
-        (
-            data.get("temperature"),
-            data.get("humidity"),
-            data.get("soil"),
-            data.get("distance"),
-            data.get("irrigation_status"),
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    print("Saved to DB")
-
-
-def send_irrigation_command():
-
-    payload = {"water": 200}
-
-    message = json.dumps(payload)
-
-    mqtt_client.publish(COMMAND_TOPIC, message)
-
-    print("Irrigation command sent:", message)
-
-
-def on_connect(client, userdata, flags, rc):
-
-    print("Connected to MQTT Broker:", rc)
-
-    client.subscribe(SENSOR_TOPIC)
-
-    print("Subscribed to:", SENSOR_TOPIC)
-
-
-def on_message(client, userdata, msg):
-
-    payload = msg.payload.decode()
-
-    print("\nReceived MQTT message:")
-    print(payload)
-
-    try:
-
-        data = json.loads(payload)
-
-        save_sensor_data(data)
-
-    except Exception as e:
-
-        print("JSON parse error:", e)
-
-
-mqtt_client = mqtt.Client()
-
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
+    print("Scheduler started...")
 
 
 def main():
-
+    # Init DBs
     init_profiles_db()
     init_sensor_db()
     init_plants_db()
 
+    # Start scheduler in separate thread
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # MQTT setup
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+    start_mqtt()
     mqtt_client.connect(BROKER, PORT, 60)
 
-    mqtt_client.loop_start()
-
-    print("MQTT listener running...")
-
-    # Scheduler
-    scheduler = BackgroundScheduler()
-
-    scheduler.add_job(send_irrigation_command, "interval", seconds=30)
-
-    scheduler.start()
-
-    print("Scheduler started: irrigation every 30 seconds")
-
-    # keep program running
-    try:
-        while True:
-            pass
-    except KeyboardInterrupt:
-        scheduler.shutdown()
+    print("System running...")
+    mqtt_client.loop_forever()
 
 
 if __name__ == "__main__":
